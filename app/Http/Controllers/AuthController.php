@@ -11,6 +11,7 @@ use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 
 class AuthController extends Controller
@@ -53,7 +54,7 @@ class AuthController extends Controller
 
         // ✅ تحقق إن الإيميل مش مسجّل
         if (User::where('email', $regData['email'])->exists()) {
-            session()->forget(['reg_data', 'payment_paid', 'kashier_order_id']);
+            session()->forget(['reg_data', 'payment_paid', 'kashier_order_id', 'payment_url']);
             return redirect()->route('login')
                 ->withErrors(['login' => 'البريد الإلكتروني مسجّل بالفعل، سجّل دخولك']);
         }
@@ -97,7 +98,7 @@ class AuthController extends Controller
         }
 
         // ✅ امسح الـ session
-        session()->forget(['reg_data', 'payment_paid', 'kashier_order_id']);
+        session()->forget(['reg_data', 'payment_paid', 'kashier_order_id', 'payment_url']);
 
         Auth::login($user);
 

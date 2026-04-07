@@ -905,6 +905,9 @@
             @elseif ($errors->any())
                 jump(3);
             @elseif (session('reg_data'))
+                @if (session('payment_url'))
+                    window._kashierUrl = '{{ session('payment_url') }}';
+                @endif
                 fillSummary(
                     '{{ addslashes(session('reg_data.name', '')) }}',
                     '{{ addslashes(session('reg_data.email', '')) }}',

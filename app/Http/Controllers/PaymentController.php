@@ -4,31 +4,37 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
 class PaymentController extends Controller
 {
-    // ═══════════════════════════════════════════════════
-    // ✅ بيانات كاشير — حطهم في .env
-    // ═══════════════════════════════════════════════════
     private function merchantId(): string
     {
-        return env('KASHIER_MERCHANT_ID', 'MID-39229-146');
+        return config('services.kashier.merchant_id');
     }
+
+    private function apiKey(): string
+    {
+        return config('services.kashier.api_key');
+    }
+
     private function secretKey(): string
     {
-        return env('KASHIER_SECRET_KEY', 'e6488dd989d7e0e68165d97bd3955d6f$208d691717993279b364489ce314e3ab4cb21c5df43bc7166cd9fff82d48ccc9cfd1ed10802a7609ab1d62a5f3ccb5c4');
+        return config('services.kashier.secret_key');
     }
+
     private function mode(): string
     {
-        return env('KASHIER_MODE', 'test');
-    } // test أو live
+        return config('services.kashier.mode', 'test');
+    }
+
     private int $price = 499;
     private string $currency = 'EGP';
 
     // ═══════════════════════════════════════════════════
     // POST /payment/session
-    // يحفظ بيانات الخطوة 1 ويرجع رابط كاشير
+    // يحفظ بيانات الخطوة 1 وينشئ Payment Session في كاشير
     // ═══════════════════════════════════════════════════
     public function saveSession(Request $request)
     {
@@ -38,7 +44,6 @@ class PaymentController extends Controller
             'email' => 'required|email',
         ]);
 
-        // تحقق إن الإيميل مش مسجّل
         if (\App\Models\User::where('email', $request->email)->exists()) {
             return response()->json([
                 'success' => false,
@@ -46,8 +51,20 @@ class PaymentController extends Controller
             ], 422);
         }
 
-        // احفظ البيانات في الـ session
+        $sessionData = $this->createKashierSession($request->email);
+
+        // log session data safely
+        Log::info('Kashier session data', ['data' => $sessionData]);
+
+        if (!$sessionData) {
+            return response()->json([
+                'success' => false,
+                'message' => 'حصل مشكلة في إنشاء جلسة الدفع — تأكد من إعدادات كاشير',
+            ], 500);
+        }
+
         session([
+            'payment_url' => $sessionData['sessionUrl'],
             'reg_data' => [
                 'name' => $request->name,
                 'phone' => $request->phone,
@@ -55,58 +72,93 @@ class PaymentController extends Controller
             ]
         ]);
 
-        // أنشئ رابط الدفع
-        $paymentUrl = $this->buildKashierUrl();
-
-        Log::info('Kashier payment URL generated', ['url' => $paymentUrl]);
+        Log::info('Kashier session created', ['sessionUrl' => $sessionData['sessionUrl']]);
 
         return response()->json([
             'success' => true,
-            'paymentUrl' => $paymentUrl,
+            'paymentUrl' => $sessionData['sessionUrl'],
         ]);
     }
 
     // ═══════════════════════════════════════════════════
-    // بناء رابط كاشير مع الـ Hash
+    // إنشاء Payment Session عبر Kashier API
     // ═══════════════════════════════════════════════════
-    private function buildKashierUrl(): string
+    private function createKashierSession(string $email): ?array
     {
         $orderId = 'ORD-' . time() . '-' . rand(1000, 9999);
-        $amount = (string) $this->price;
-        $currency = $this->currency;
-        $merchantId = $this->merchantId();
-        $successUrl = url('/payment/success');
-        $failUrl = url('/payment/fail');
 
-        // احفظ الـ orderId
         session(['kashier_order_id' => $orderId]);
 
-        // ✅ بناء الـ Hash (HMAC SHA256)
-        // الصيغة: ?payment={merchantId}.{orderId}.{amount}.{currency}
-        $hashData = "?payment={$merchantId}.{$orderId}.{$amount}.{$currency}";
-        $hash = hash_hmac('sha256', $hashData, $this->secretKey());
+        $apiUrl = $this->mode() === 'live'
+            ? 'https://api.kashier.io/v3/payment/sessions'
+            : 'https://test-api.kashier.io/v3/payment/sessions';
 
-        // ✅ بناء رابط كاشير
-        $baseUrl = $this->mode() === 'live'
-            ? 'https://checkout.kashier.io'
-            : 'https://test-checkout.kashier.io';
+        $body = [
+            'merchantId'    => $this->merchantId(),
+            'amount'        => (string) $this->price,
+            'currency'      => $this->currency,
+            'order'         => $orderId,
+            'paymentType'   => 'credit',
+            'type'          => 'one-time',
+            'display'       => 'ar',
+            'brandColor'    => '#7c3aed',
+            'allowedMethods' => 'card,wallet',
+            'enable3DS'     => true,
+            'merchantRedirect' => url('/payment/success'),
+            'failureRedirect'  => true,
+            'serverWebhook'    => url('/payment/webhook'),
+            'description'      => 'اشتراك DevHive',
+            'expireAt'         => now()->addHours(2)->toIso8601String(),
+            'maxFailureAttempts' => 3,
+            'customer' => [
+                'email'     => $email,
+                'reference' => $orderId,
+            ],
+        ];
 
-        $params = http_build_query([
-            'merchantId' => $merchantId,
-            'orderId' => $orderId,
-            'amount' => $amount,
-            'currency' => $currency,
-            'hash' => $hash,
-            'mode' => $this->mode(),
-            'merchantRedirect' => $successUrl,
-            'failureRedirect' => $failUrl,
-            'display' => 'ar',
-            'brandColor' => '7c3aed',
-            'allowedMethods' => 'card,wallet,bank_installments',
-            'description' => 'اشتراك DivHive',
-        ]);
+        try {
+            $response = Http::withHeaders([
+                'Authorization' => $this->secretKey(),
+                'api-key'       => $this->apiKey(),
+                'Content-Type'  => 'application/json',
+            ])->post($apiUrl, $body);
 
-        return $baseUrl . '/?' . $params;
+            Log::info('Kashier API response', [
+                'status' => $response->status(),
+                'body'   => $response->json(),
+            ]);
+
+            if (!$response->successful()) {
+                Log::error('Kashier API error', [
+                    'status' => $response->status(),
+                    'body'   => $response->body(),
+                ]);
+                return null;
+            }
+
+            $data = $response->json();
+
+            // الـ sessionUrl بيجي في الـ response مباشرة
+            $sessionUrl = $data['sessionUrl'] ?? null;
+            $sessionId  = $data['_id'] ?? null;
+
+            if (!$sessionUrl) {
+                Log::error('Kashier: no sessionUrl in response', $data);
+                return null;
+            }
+
+            session(['kashier_session_id' => $sessionId]);
+
+            return [
+                'sessionUrl' => $sessionUrl,
+                'sessionId'  => $sessionId,
+            ];
+        } catch (\Exception $e) {
+            Log::error('Kashier API exception', [
+                'message' => $e->getMessage(),
+            ]);
+            return null;
+        }
     }
 
     // ═══════════════════════════════════════════════════
@@ -116,16 +168,19 @@ class PaymentController extends Controller
     {
         Log::info('Kashier success callback', $request->all());
 
-        // ✅ تحقق من صحة الـ Hash اللي بيبعته كاشير
-        // كاشير بيبعت: orderId, amount, currency, hash في الـ query string
-        $isValid = $this->verifyCallback($request);
+        // تحقق من حالة الدفع عن طريق الـ Session API
+        $sessionId = session('kashier_session_id');
 
-        if (!$isValid) {
-            Log::warning('Kashier: invalid hash in callback', $request->all());
-            // في بيئة التيست نكمل — في الإنتاج ارفض
-            if ($this->mode() === 'live') {
-                return redirect()->route('register')
-                    ->with('payment_error', '❌ فشل التحقق من الدفع');
+        if ($sessionId) {
+            $verified = $this->verifyPaymentSession($sessionId);
+            if (!$verified) {
+                Log::warning('Kashier: payment session not verified', [
+                    'sessionId' => $sessionId,
+                ]);
+                if ($this->mode() === 'live') {
+                    return redirect()->route('register')
+                        ->with('payment_error', 'فشل التحقق من الدفع');
+                }
             }
         }
 
@@ -139,9 +194,9 @@ class PaymentController extends Controller
     public function fail(Request $request)
     {
         Log::info('Kashier fail callback', $request->all());
-        session()->forget(['payment_paid', 'kashier_order_id']);
+        session()->forget(['payment_paid', 'kashier_order_id', 'kashier_session_id', 'payment_url']);
         return redirect()->route('register')
-            ->with('payment_error', '❌ فشل الدفع! يرجى المحاولة مرة أخرى.');
+            ->with('payment_error', 'فشل الدفع! يرجى المحاولة مرة أخرى.');
     }
 
     // ═══════════════════════════════════════════════════
@@ -150,25 +205,52 @@ class PaymentController extends Controller
     public function webhook(Request $request)
     {
         Log::info('Kashier webhook', $request->all());
+
+        $data = $request->all();
+        $sessionId = $data['sessionId'] ?? $data['_id'] ?? null;
+        $status = $data['status'] ?? null;
+
+        if ($sessionId && $status === 'PAID') {
+            Log::info('Kashier webhook: payment confirmed', [
+                'sessionId' => $sessionId,
+                'status' => $status,
+            ]);
+        }
+
         return response()->json(['status' => 'ok']);
     }
 
     // ═══════════════════════════════════════════════════
-    // التحقق من الـ Hash في الـ Callback
+    // التحقق من حالة الـ Session عبر الـ API
     // ═══════════════════════════════════════════════════
-    private function verifyCallback(Request $request): bool
+    private function verifyPaymentSession(string $sessionId): bool
     {
-        $receivedHash = $request->get('hash', '');
-        if (!$receivedHash)
+        $apiUrl = $this->mode() === 'live'
+            ? "https://api.kashier.io/v3/payment/sessions/{$sessionId}/payment"
+            : "https://test-api.kashier.io/v3/payment/sessions/{$sessionId}/payment";
+
+        try {
+            $response = Http::withHeaders([
+                'Authorization' => $this->secretKey(),
+                'api-key'       => $this->apiKey(),
+            ])->get($apiUrl);
+
+            if (!$response->successful()) {
+                return false;
+            }
+
+            $data = $response->json();
+            $status = $data['data']['status'] ?? '';
+
+            Log::info('Kashier session verification', [
+                'sessionId' => $sessionId,
+                'status'    => $status,
+            ]);
+
+            return in_array($status, ['PAID', 'PENDING']);
+        } catch (\Exception $e) {
+            Log::error('Kashier verify exception', ['message' => $e->getMessage()]);
             return false;
-
-        $orderId = $request->get('orderId', '');
-        $amount = $request->get('amount', '');
-        $currency = $request->get('currency', '');
-
-        $hashData = "?payment={$this->merchantId()}.{$orderId}.{$amount}.{$currency}";
-        $expectedHash = hash_hmac('sha256', $hashData, $this->secretKey());
-
-        return hash_equals($expectedHash, $receivedHash);
+        }
     }
 }
